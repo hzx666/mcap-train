@@ -8,12 +8,15 @@ Unlike extract_head_mp4.py this script:
   - muxes the original bitstream into MP4 (no resize, no re-encode)
   - stores outputs under train_data/ instead of preview/
   - does not generate first-frame JPG thumbnails
+  - writes {CAM}_timestamp.txt with original message.log_time in integer ns
+  - validates one display frame per nonempty payload and final MP4 frame count
 
 All parameters via environment variables:
   MCAP_PATH        MCAP file path or folder containing .mcap files (required)
   OUT_DIR          local output directory (default: ./output)
   FPS              MP4 timestamp fps, 0 = auto from timestamps (default: 0)
-  OVERWRITE        overwrite existing MP4 files (default: 1; set 0 to skip)
+  OVERWRITE        rebuild MP4/timestamp pairs (default: 1; 0 skips complete pairs,
+                   fails on incomplete pairs)
   N_WORKERS        parallel files to process (default: 2)
   OSS_OUTPUT_PREFIX  when set, upload to OSS (original_data -> this prefix)
 
@@ -31,7 +34,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import av
 from mcap.reader import make_reader
@@ -159,17 +162,18 @@ def inspect_camera_topics(mcap_path: Path, topics: list[str],
             topic = ch.topic
             if topic not in pending:
                 continue
+            data = extract_field(msg.data, 3)
+            if not data:
+                continue
             if codecs[topic] is None:
                 fmt = extract_field(msg.data, 4)
                 fmt_str = fmt.decode("utf-8", errors="replace") if fmt else None
                 codecs[topic] = _normalize_codec(fmt_str)
                 if codecs[topic] is None:
-                    data = extract_field(msg.data, 3)
-                    if data:
-                        codecs[topic] = _codec_from_annexb(data)
+                    codecs[topic] = _codec_from_annexb(data)
             if len(times[topic]) < time_needed:
                 times[topic].append(msg.log_time)
-            if len(times[topic]) >= time_needed:
+            if len(times[topic]) >= time_needed and codecs[topic] is not None:
                 pending.discard(topic)
             if not pending:
                 break
@@ -352,8 +356,8 @@ def _compute_oss_output_prefix(source_key: str, oss_output_prefix: str) -> str:
         return ""
     replaced = source_key.replace("original_data", oss_output_prefix, 1)
     if replaced.endswith(".mcap"):
-        stem = Path(replaced).stem
-        dir_path = str(Path(replaced).parent)
+        stem = PurePosixPath(replaced).stem
+        dir_path = str(PurePosixPath(replaced).parent)
         return f"{dir_path}/{stem}/{OUTPUT_SUBDIR}"
     dir_path = replaced.rstrip("/")
     return f"{dir_path}/{OUTPUT_SUBDIR}"
@@ -366,14 +370,66 @@ def _object_exists(bucket, oss_key: str) -> bool:
         return False
 
 
+class _FrameMappingValidator:
+    """Require one decoded display frame per payload, in message order.
+
+    Synthetic packet PTS carry message indices through decoder buffering.
+    Reordered, missing or multiple frames are rejected, never guessed.
+    This validation is head-camera only; it does not change encoded output.
+    """
+
+    def __init__(self, codec: str):
+        self.decoder = av.CodecContext.create(codec, "r")
+        self.decoder.options = {"err_detect": "explode"}
+        self.accepted = 0
+        self.decoded = 0
+
+    def _check(self, frames):
+        for frame in frames:
+            if frame.is_corrupt or frame.pts != self.decoded:
+                raise RuntimeError(
+                    f"frame mapping invalid: display_index={self.decoded}, "
+                    f"message_index={frame.pts}, corrupt={frame.is_corrupt}"
+                )
+            self.decoded += 1
+
+    def feed(self, payload: bytes):
+        if not _has_annexb_start(payload):
+            payload = b"\x00\x00\x00\x01" + payload
+        packet = av.Packet(payload)
+        packet.pts = packet.dts = self.accepted
+        packet.time_base = Fraction(1, 1)
+        self._check(self.decoder.decode(packet))
+        self.accepted += 1
+
+    def finish(self):
+        self._check(self.decoder.decode(None))
+        if self.decoded != self.accepted:
+            raise RuntimeError(
+                f"frame mapping count mismatch: payloads={self.accepted}, frames={self.decoded}"
+            )
+
+
+def _count_video_frames(path: Path) -> int:
+    """Count decoded frames, not container metadata or duration * FPS."""
+    with av.open(str(path)) as container:
+        container.streams.video[0].codec_context.options = {"err_detect": "explode"}
+        count = 0
+        for frame in container.decode(video=0):
+            if frame.is_corrupt:
+                raise RuntimeError(f"corrupt output frame: {path.name}, index={count}")
+            count += 1
+        return count
+
+
 # ---- single MCAP processor ----
 
 def process_one(mcap_path: Path, train_dir: Path,
                 fps_override: int, bucket=None, oss_key_prefix: str = "") -> bool:
     """Process a single MCAP file -> four full-length original-quality MP4s.
 
-    Returns True on success (including skip-existing). False if cameras are
-    missing or any attempted camera copied 0 packets.
+    Returns True on success (including skip-existing), False if no cameras exist.
+    Invalid frames, incomplete pairs and publication failures raise an exception.
     """
     cameras = list_camera_topics(mcap_path)
     if not cameras:
@@ -385,24 +441,32 @@ def process_one(mcap_path: Path, train_dir: Path,
 
     need: dict[str, str] = {}
     for cam, topic in cameras.items():
-        output_name = f"{cam}.mp4"
-        if bucket and oss_key_prefix:
-            exists = _object_exists(bucket, f"{oss_key_prefix}/{output_name}")
-        else:
-            exists = (train_dir / output_name).exists()
-        if exists and not overwrite:
-            print(f"  SKIP {cam}: {output_name} already exists (OVERWRITE=0)")
-            continue
+        if not overwrite:
+            names = (f"{cam}.mp4", f"{cam}_timestamp.txt")
+            # Propagate OSS errors: a failed existence check is not permission to overwrite.
+            exists = [bucket.object_exists(f"{oss_key_prefix}/{name}")
+                      if bucket and oss_key_prefix else (train_dir / name).exists()
+                      for name in names]
+            if all(exists):
+                print(f"  SKIP {cam}: MP4 and timestamps already exist (OVERWRITE=0)")
+                continue
+            if any(exists):
+                raise RuntimeError(
+                    f"{cam}: incomplete MP4/timestamp pair; use OVERWRITE=1 to rebuild"
+                )
         need[cam] = topic
 
     if not need:
-        print("  SKIP: all camera MP4s already exist")
+        print("  SKIP: all camera MP4/timestamp pairs already exist")
         return True
 
     specs = inspect_camera_topics(mcap_path, list(need.values()), fps_override)
     muxers: dict[str, StreamCopyMuxer] = {}
     tmp_paths: dict[str, Path] = {}
-    zero_packet_cams: list[str] = []
+    timestamp_paths: dict[str, Path] = {}
+    timestamps = {cam: [] for cam in need}
+    message_counts = {cam: 0 for cam in need}
+    validators = {}
     try:
         for cam, topic in need.items():
             fps, codec = specs[topic]
@@ -411,6 +475,7 @@ def process_one(mcap_path: Path, train_dir: Path,
             tmp.close()
             tmp_paths[cam] = tmp_path
             muxers[cam] = StreamCopyMuxer(tmp_path, fps, cam, codec=codec)
+            validators[cam] = _FrameMappingValidator(codec)
             print(f"  Copying {cam} ({topic}) @ {fps:.2f} fps, codec={codec}, original bitstream")
 
         topics = list(need.values())
@@ -422,28 +487,59 @@ def process_one(mcap_path: Path, train_dir: Path,
                 mux = muxers.get(cam)
                 if mux is None:
                     continue
+                message_counts[cam] += 1
                 data_field = extract_field(msg.data, 3)
-                if data_field is None:
+                if not data_field:
                     continue
+                try:
+                    validators[cam].feed(data_field)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{mcap_path} [{cam}] message={message_counts[cam]}: {exc}"
+                    ) from exc
                 mux.feed(data_field)
+                timestamps[cam].append(int(msg.log_time))
 
+        # Validate every camera before publishing any new output for this MCAP.
         for cam, mux in muxers.items():
+            if not timestamps[cam]:
+                raise RuntimeError(f"{mcap_path} [{cam}]: no valid frames")
+            try:
+                validators[cam].finish()
+            except Exception as exc:
+                raise RuntimeError(f"{mcap_path} [{cam}]: {exc}") from exc
             mux.close()
             muxers[cam] = None
             tmp_path = tmp_paths[cam]
-            output_name = f"{cam}.mp4"
-            if mux.n == 0:
-                print(f"  [{cam}] no packets, skipping upload")
-                zero_packet_cams.append(cam)
-                continue
-            if bucket and oss_key_prefix:
-                oss_key = f"{oss_key_prefix}/{output_name}"
-                bucket.put_object_from_file(oss_key, str(tmp_path))
-                print(f"    uploaded {oss_key}")
-            else:
-                dest = train_dir / output_name
-                shutil.copy2(tmp_path, dest)
-                print(f"    saved {dest}")
+            frame_count = _count_video_frames(tmp_path)
+            print(f"  [{cam}] messages={message_counts[cam]}, payloads={mux.n}, "
+                  f"skipped={message_counts[cam] - mux.n}, frames={frame_count}, "
+                  f"timestamps={len(timestamps[cam])}")
+            if frame_count != len(timestamps[cam]):
+                raise RuntimeError(f"{mcap_path} [{cam}]: MP4/timestamp count mismatch")
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                             suffix=".txt", delete=False) as output:
+                timestamp_paths[cam] = Path(output.name)
+                output.writelines(f"{stamp}\n" for stamp in timestamps[cam])
+
+        for cam in need:
+            for name, source in ((f"{cam}.mp4", tmp_paths[cam]),
+                                 (f"{cam}_timestamp.txt", timestamp_paths[cam])):
+                if bucket and oss_key_prefix:
+                    oss_key = f"{oss_key_prefix}/{name}"
+                    bucket.put_object_from_file(oss_key, str(source))
+                    print(f"    uploaded {oss_key}")
+                else:
+                    train_dir.mkdir(parents=True, exist_ok=True)
+                    # Stage on the destination filesystem for atomic per-file replacement.
+                    with tempfile.NamedTemporaryFile(dir=train_dir, delete=False) as staged:
+                        staged_path = Path(staged.name)
+                    try:
+                        shutil.copyfile(source, staged_path)
+                        os.replace(staged_path, train_dir / name)
+                    finally:
+                        staged_path.unlink(missing_ok=True)
+                    print(f"    saved {train_dir / name}")
     finally:
         for mux in muxers.values():
             if mux is not None:
@@ -453,10 +549,9 @@ def process_one(mcap_path: Path, train_dir: Path,
                     pass
         for tmp_path in tmp_paths.values():
             tmp_path.unlink(missing_ok=True)
+        for tmp_path in timestamp_paths.values():
+            tmp_path.unlink(missing_ok=True)
 
-    if zero_packet_cams:
-        print(f"  ERROR: no packets for: {', '.join(zero_packet_cams)}")
-        return False
     return True
 
 
@@ -559,6 +654,8 @@ def main():
 
     if mcap_path.is_dir():
         mcap_files = sorted(mcap_path.rglob("*.mcap"))
+        if not mcap_files:
+            sys.exit(f"No .mcap files found in {mcap_path}")
         n_workers = min(int(os.environ.get("N_WORKERS", "2")), os.cpu_count() or 2, len(mcap_files))
         print(f"Found {len(mcap_files)} .mcap file(s) in {mcap_path}, using {n_workers} workers")
 
@@ -568,10 +665,11 @@ def main():
             train_dir = out_dir / rel.parent / rel.stem / OUTPUT_SUBDIR
             train_dir.mkdir(parents=True, exist_ok=True)
             if oss_source_key:
-                oss_key_prefix = _compute_oss_output_prefix(oss_source_key, oss_prefix)
+                source_key = f"{oss_source_key.rstrip('/')}/{rel.as_posix()}"
+                oss_key_prefix = _compute_oss_output_prefix(source_key, oss_prefix)
             else:
                 oss_key_prefix = (
-                    f"{oss_prefix}/{rel.parent / rel.stem}/{OUTPUT_SUBDIR}"
+                    f"{oss_prefix}/{rel.with_suffix('').as_posix()}/{OUTPUT_SUBDIR}"
                     if oss_prefix else ""
                 )
             print(f"\n[{i}/{len(mcap_files)}] Processing: {rel}")

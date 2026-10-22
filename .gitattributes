@@ -1,0 +1,2 @@
+# Keep text files consistent across Windows and Linux/Docker checkouts.
+* text=auto eol=lf
