@@ -5,31 +5,31 @@ Long-running MCAP extraction service that consumes Alibaba Cloud MNS.
 Same worker model and OSS path mapping as run_extract.py. Redis consumption
 in run_extract.py is unchanged. This process only replaces the queue source.
 
-Messages are an event envelope. This service handles event "train_extract"
-and acks manually (DeleteMessage) only after the result is sent.
-Other events are not acked; their visibility is shortened so another
-consumer can take them.
+Messages are an event envelope. This service handles event "mcap_extract_train"
+and acks manually (DeleteMessage). Other events are not acked; their
+visibility is shortened so another consumer can take them.
 
-After train_extract finishes, one result envelope is sent to MNS_RESULT_QUEUE_NAME
-with the same event and data. Success is code 200 and msg "". A failed attempt
-is retried without writing. Only the last attempt writes code 500, then acks,
-so a failure is not published again on later deliveries. Base64 encoding
-follows MNS_BASE64 (default on), matching the Java SDK.
+After a task finishes, one result envelope is sent to MNS_RESULT_QUEUE_NAME
+(default: data-platfrom-event-resp). Success is code 200 and msg "". A failed
+attempt is retried without writing. Only the last attempt writes code 500,
+then acks. Set MNS_WRITE_RESULT=false to skip the result queue. Base64
+encoding follows MNS_BASE64 (default on), matching the Java SDK.
 
 Envelope:
-  {"event": "train_extract", "code": 200, "msg": "", "traceId": "", "data": {"ossPath": "oss://..."}}
+  {"event": "mcap_extract_train", "code": 200, "msg": "", "traceId": "", "data": {"ossPath": "oss://..."}}
 
 Environment:
   MNS_ENDPOINT            required, e.g. http://<uid>.mns.cn-shanghai-internal.aliyuncs.com
   MNS_QUEUE_NAME          required consume queue name
-  MNS_RESULT_QUEUE_NAME   required queue that receives the result envelope
+  MNS_WRITE_RESULT        write the result queue (default: true)
+  MNS_RESULT_QUEUE_NAME   result queue (default: data-platfrom-event-resp)
   MNS_ACCESS_KEY_ID       default: OSS_ACCESS_KEY_ID
   MNS_ACCESS_KEY_SECRET   default: OSS_ACCESS_KEY_SECRET
   MNS_SECURITY_TOKEN      optional STS token
-  MNS_EVENT               event this process handles (default: train_extract)
+  MNS_EVENT               event this process handles (default: mcap_extract_train)
   MNS_BASE64              decode message body as base64 (default: true, SDK default)
   MNS_WAIT_SECONDS        long-poll seconds, 0-30 (default: min(POLL_INTERVAL, 30))
-  MNS_VISIBILITY_TIMEOUT  hide a train_extract message while processing (default: 3600)
+  MNS_VISIBILITY_TIMEOUT  hide a mcap_extract_train message while processing (default: 3600)
   MNS_RETRY_SECONDS       when not acked, become visible again after this many seconds (default: 30)
   MNS_MAX_ATTEMPTS        receive count that may write one code 500 (default: 3)
   POLL_INTERVAL           reconnect backoff, shared with run_extract.py (default: 10)
@@ -48,7 +48,7 @@ import run_extract as rx
 
 MNS_ENDPOINT = os.environ.get("MNS_ENDPOINT", "").strip()
 MNS_QUEUE_NAME = os.environ.get("MNS_QUEUE_NAME", "").strip()
-MNS_RESULT_QUEUE_NAME = os.environ.get("MNS_RESULT_QUEUE_NAME", "").strip()
+MNS_RESULT_QUEUE_NAME = os.environ.get("MNS_RESULT_QUEUE_NAME", "data-platfrom-event-resp").strip()
 MNS_ACCESS_KEY_ID = (
     os.environ.get("MNS_ACCESS_KEY_ID")
     or os.environ.get("OSS_ACCESS_KEY_ID")
@@ -78,7 +78,8 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
-MNS_EVENT = os.environ.get("MNS_EVENT", "train_extract").strip() or "train_extract"
+MNS_EVENT = os.environ.get("MNS_EVENT", "mcap_extract_train").strip() or "mcap_extract_train"
+MNS_WRITE_RESULT = _env_bool("MNS_WRITE_RESULT", True)
 MNS_BASE64 = _env_bool("MNS_BASE64", True)
 MNS_WAIT_SECONDS = max(0, min(30, _env_int("MNS_WAIT_SECONDS", min(rx.POLL_INTERVAL, 30))))
 MNS_VISIBILITY_TIMEOUT = _env_int("MNS_VISIBILITY_TIMEOUT", 3600)
@@ -240,13 +241,19 @@ def _report_failure(worker_id: int, message_id: str, envelope: dict, msg: str,
 
 
 def _finish(worker_id: int, message_id: str, envelope: dict, code: int, msg: str, publish, ack):
-    """Publish the result, then ack the source message. A send failure skips the ack."""
-    publish(envelope, code, msg)
+    """Ack the source message. Publish the result only when MNS_WRITE_RESULT is on."""
+    if MNS_WRITE_RESULT:
+        publish(envelope, code, msg)
+        rx._tprint(
+            f"[{rx._now()}] Worker-{worker_id}: result code={code} sent and acked  "
+            f"message_id={message_id}"
+        )
+    else:
+        rx._tprint(
+            f"[{rx._now()}] Worker-{worker_id}: acked, result not written  "
+            f"code={code} message_id={message_id}"
+        )
     ack()
-    rx._tprint(
-        f"[{rx._now()}] Worker-{worker_id}: result code={code} sent and acked  "
-        f"message_id={message_id}"
-    )
 
 
 def _delete_message(queue, receipt_handle: str, worker_id: int):
@@ -273,14 +280,14 @@ def _change_visibility(queue, receipt_handle: str, seconds: int, worker_id: int)
         return receipt_handle
 
 
-def _handle_train_extract(worker_id: int, envelope: dict, message_id: str, ack, extend, publish,
+def _handle_mcap_extract_train(worker_id: int, envelope: dict, message_id: str, ack, extend, publish,
                           dequeue_count: int):
     """Extract oss_path from data. Publish the result envelope, then ack."""
     code = envelope.get("code", 200)
     msg = envelope.get("msg") or ""
     if not _code_ok(code):
         rx._tprint(
-            f"[{rx._now()}] Worker-{worker_id}: train_extract code={code} "
+            f"[{rx._now()}] Worker-{worker_id}: mcap_extract_train code={code} "
             f"msg={msg!r}, ack without extract  message_id={message_id}"
         )
         ack()
@@ -289,7 +296,7 @@ def _handle_train_extract(worker_id: int, envelope: dict, message_id: str, ack, 
     data = envelope.get("data")
     oss_path = rx._normalize_oss_path(_find_oss_path(data))
     rx._tprint(
-        f"[{rx._now()}] Worker-{worker_id} train_extract: {oss_path}  "
+        f"[{rx._now()}] Worker-{worker_id} mcap_extract_train: {oss_path}  "
         f"message_id={message_id}"
     )
     if not oss_path:
@@ -349,7 +356,7 @@ def _handle_train_extract(worker_id: int, envelope: dict, message_id: str, ack, 
 
 
 _HANDLERS = {
-    "train_extract": _handle_train_extract,
+    "mcap_extract_train": _handle_mcap_extract_train,
 }
 
 
@@ -385,10 +392,11 @@ def _worker_loop(worker_id: int):
     queue = None
     result_queue = None
     while not rx._shutdown_event.is_set():
-        if queue is None or result_queue is None:
+        if queue is None or (MNS_WRITE_RESULT and result_queue is None):
             try:
                 queue = _open_queue(MNS_QUEUE_NAME)
-                result_queue = _open_queue(MNS_RESULT_QUEUE_NAME)
+                if MNS_WRITE_RESULT:
+                    result_queue = _open_queue(MNS_RESULT_QUEUE_NAME)
             except Exception as e:
                 rx._tprint(f"[ERROR] Worker-{worker_id}: MNS connection failed: {e}")
                 queue = None
@@ -403,7 +411,8 @@ def _worker_loop(worker_id: int):
                 continue
             rx._tprint(f"[ERROR] Worker-{worker_id}: MNS receive failed: {e}")
             queue = None
-            result_queue = None
+            if MNS_WRITE_RESULT:
+                result_queue = None
             rx._shutdown_event.wait(rx.POLL_INTERVAL)
             continue
 
@@ -421,7 +430,8 @@ def _worker_loop(worker_id: int):
             )
 
         def publish(envelope, code, msg):
-            _publish_result(result_queue, envelope, code, msg)
+            if MNS_WRITE_RESULT:
+                _publish_result(result_queue, envelope, code, msg)
 
         try:
             action = _dispatch(
@@ -433,7 +443,8 @@ def _worker_loop(worker_id: int):
                 f"[{rx._now()}] Worker-{worker_id}: process failed, not acked: {e}"
             )
             action = "nack"
-            result_queue = None
+            if MNS_WRITE_RESULT:
+                result_queue = None
 
         if state["acked"]:
             _delete_message(queue, state["receipt"], worker_id)
@@ -449,9 +460,9 @@ def _check_config():
         missing.append("MNS_ENDPOINT")
     if not MNS_QUEUE_NAME:
         missing.append("MNS_QUEUE_NAME")
-    if not MNS_RESULT_QUEUE_NAME:
+    if MNS_WRITE_RESULT and not MNS_RESULT_QUEUE_NAME:
         missing.append("MNS_RESULT_QUEUE_NAME")
-    if MNS_QUEUE_NAME and MNS_QUEUE_NAME == MNS_RESULT_QUEUE_NAME:
+    if MNS_WRITE_RESULT and MNS_QUEUE_NAME and MNS_QUEUE_NAME == MNS_RESULT_QUEUE_NAME:
         print("[ERROR] MNS_RESULT_QUEUE_NAME must be a different queue from MNS_QUEUE_NAME")
         sys.exit(1)
     if not MNS_ACCESS_KEY_ID:
@@ -484,14 +495,18 @@ def main():
     try:
         queue = _open_queue(MNS_QUEUE_NAME)
         meta = queue.get_attributes()
-        _open_queue(MNS_RESULT_QUEUE_NAME).get_attributes()
+        if MNS_WRITE_RESULT:
+            _open_queue(MNS_RESULT_QUEUE_NAME).get_attributes()
     except Exception as e:
         print(f"[ERROR] MNS connect failed: {e}")
         sys.exit(1)
 
     print(f"[{rx._now()}] MCAP Extract Service (MNS) started")
     print(f"  MNS:           {MNS_ENDPOINT}  queue={MNS_QUEUE_NAME}")
-    print(f"  Result queue:  {MNS_RESULT_QUEUE_NAME}")
+    if MNS_WRITE_RESULT:
+        print(f"  Result queue:  {MNS_RESULT_QUEUE_NAME}")
+    else:
+        print("  Result queue:  off")
     print(f"  Event:         {MNS_EVENT}  (manual ack)")
     print(f"  Base64 body:   {MNS_BASE64}")
     print(f"  Wait seconds:  {MNS_WAIT_SECONDS}")
@@ -508,7 +523,7 @@ def main():
     rx._append_log(
         f"{'='*72}\n"
         f"[{rx._now()}] service started  workers={rx.N_WORKERS} "
-        f"mns queue={MNS_QUEUE_NAME} result={MNS_RESULT_QUEUE_NAME}\n"
+        f"mns queue={MNS_QUEUE_NAME} result={'off' if not MNS_WRITE_RESULT else MNS_RESULT_QUEUE_NAME}\n"
     )
 
     threads = []

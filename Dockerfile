@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract_head_train_mp4.py run_extract.py run_extract_mns.py push_excel_redis.py drain_redis.py queue_pending.py rename_train_data.py ./
+COPY extract_head_train_mp4.py extract_orin_mp4.py run_extract.py run_extract_mns.py push_excel_redis.py send_mns.py drain_redis.py queue_pending.py rename_train_data.py ./
 
 # run_extract.py 作为常驻服务运行，轮询 Redis 队列获取任务，
 # 头环路径路由到 extract_head_train_mp4.py（全长四路相机 MP4）。
@@ -32,6 +32,8 @@ COPY extract_head_train_mp4.py run_extract.py run_extract_mns.py push_excel_redi
 #   python3 rename_train_data.py
 #
 # MNS 消费（路径映射与 run_extract.py 相同，默认入口仍是 Redis）:
+#   python3 send_mns.py --dry-run --oss-path oss://bucket/a.mcap --trace-id t1
+#   python3 send_mns.py --oss-path oss://bucket/a.mcap --trace-id t1
 #   python3 run_extract_mns.py
 #   docker run --entrypoint python ... mcap-extract-train run_extract_mns.py
 #
